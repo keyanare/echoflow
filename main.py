@@ -3,10 +3,11 @@ from collections import defaultdict
 from os import getenv
 
 import discord
-import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+from ytdl_source import YTDLSource, ytdl
 
 load_dotenv()
 
@@ -14,59 +15,20 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.voice_states = True
 
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": False,
-    "nocheckcertificate": True,
-    "ignoreerrors": False,
-    "logtostderr": False,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "auto",
-    "source_address": "0.0.0.0",
-    "extract_flat": "in_playlist",
-    "playlistend": 20,
-}
-
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="", intents=intents)
 
     async def setup_hook(self):
         await self.tree.sync()
         print("[+] Slash commands successfully synchronized with Discord!")
 
 
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get("title")
-        self.url = data.get("url")
-
-    @classmethod
-    async def from_url(cls, url, *, loop=None):
-        loop = loop or asyncio.get_event_loop()
-        with yt_dlp.YoutubeDL(
-            {"format": "bestaudio/best", "quiet": True}
-        ) as ydl_single:
-            data = await loop.run_in_executor(
-                None, lambda: ydl_single.extract_info(url, download=False)
-            )
-        filename = data["url"]
-        return cls(discord.FFmpegPCMAudio(filename, **FFMPEG_OPTIONS), data=data)
-
-
 bot = MusicBot()
 song_queues = defaultdict(list)
+guild_locks = defaultdict(asyncio.Lock)
+text_channels = {}
 
 
 @bot.event
@@ -74,37 +36,73 @@ async def on_ready():
     print(self_name := f"[+] {bot.user.name} successfully started.")
 
 
-async def _play_next_async(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    queue = song_queues[guild_id]
-    voice_client = interaction.guild.voice_client
-
-    if not voice_client or not voice_client.is_connected():
-        queue.clear()
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot or before.channel is None:
         return
 
-    if len(queue) > 0:
-        next_track = queue.pop(0)
-        url = next_track["url"]
-        title = next_track["title"]
+    guild = before.channel.guild
+    voice_client = guild.voice_client
+    if voice_client is None or voice_client.channel != before.channel:
+        return
 
-        try:
-            player = await YTDLSource.from_url(url, loop=bot.loop)
+    members_left = [m for m in before.channel.members if not m.bot]
+    if len(members_left) > 0:
+        return
 
-            if not voice_client or not voice_client.is_connected():
-                queue.clear()
+    await asyncio.sleep(30)
+
+    voice_client = guild.voice_client
+    if voice_client is None or voice_client.channel != before.channel:
+        return
+
+    members_now = [m for m in voice_client.channel.members if not m.bot]
+    if len(members_now) == 0:
+        song_queues[guild.id] = []
+        await voice_client.disconnect()
+
+        text_channel = text_channels.get(guild.id)
+        if text_channel is not None:
+            await text_channel.send(
+                "Everyone left the voice channel — disconnecting, queue cleared."
+            )
+
+
+async def _play_next_async(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    async with guild_locks[guild_id]:
+        queue = song_queues[guild_id]
+        voice_client = interaction.guild.voice_client
+
+        if not voice_client or not voice_client.is_connected():
+            queue.clear()
+            return
+
+        if voice_client.is_playing() or voice_client.is_paused():
+            return
+
+        while len(queue) > 0:
+            next_track = queue.pop(0)
+            url = next_track["url"]
+            title = next_track["title"]
+
+            try:
+                player = await YTDLSource.from_url(url, loop=bot.loop)
+
+                if not voice_client.is_connected():
+                    queue.clear()
+                    return
+
+                voice_client.play(player, after=lambda e: play_next(interaction))
+                await interaction.channel.send(f"**Now playing:** {title}")
                 return
+            except Exception as e:
+                print(f"Playback error: {e}")
+                await interaction.channel.send(f"Can't play: {title}")
 
-            voice_client.play(player, after=lambda e: play_next(interaction))
-            await interaction.channel.send(f"**Now playing:** {title}")
-        except Exception as e:
-            print(f"Playback error: {e}")
-            await interaction.channel.send(f"Can't play: {title}")
-
-            if voice_client and voice_client.is_connected():
-                await _play_next_async(interaction)
-            else:
-                queue.clear()
+                if not voice_client.is_connected():
+                    queue.clear()
+                    return
 
 
 def play_next(interaction: discord.Interaction):
@@ -113,11 +111,12 @@ def play_next(interaction: discord.Interaction):
 
 @bot.tree.command(name="join", description="Connect the bot to a voice channel.")
 async def join(interaction: discord.Interaction):
-    if not interaction.author.voice:
+    if not interaction.user.voice:
         await interaction.response.send_message(
             "You must be in voice channel to use that command."
         )
         return
+    text_channels[interaction.guild_id] = interaction.channel
     channel = interaction.user.voice.channel
     if interaction.guild.voice_client is not None:
         return await interaction.guild.voice_client.move_to(channel)
@@ -144,6 +143,8 @@ async def leave(interaction: discord.Interaction):
 @app_commands.describe(url="Link to a video, playlist or search query")
 async def play(interaction: discord.Interaction, url: str):
     await interaction.response.defer()
+
+    text_channels[interaction.guild_id] = interaction.channel
 
     voice_client = interaction.guild.voice_client
     if not voice_client:
