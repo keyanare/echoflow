@@ -48,6 +48,24 @@ Tracks are queued per-server, and playback automatically advances to the next tr
 
 On startup, the bot syncs its slash commands with Discord and logs a confirmation message once ready.
 
+## Running with Docker
+
+Alternatively, you can run the bot in a container — FFmpeg and Opus are already included in the image, so no local dependencies are needed beyond Docker itself.
+
+1. Build the image:
+
+   ```bash
+   docker build -t echoflow .
+   ```
+
+2. Run the bot, passing the token via the environment file (see [Setup](#setup) for creating `.env`):
+
+   ```bash
+   docker run -d --name echoflow --restart unless-stopped --env-file .env echoflow
+   ```
+
+To view logs use `docker logs -f echoflow`, and to stop the bot use `docker stop echoflow`.
+
 ## Notes
 
 - `yt-dlp` handles metadata extraction and streaming for both direct links and search queries (`ytsearch1:<query>`).
