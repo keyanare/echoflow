@@ -1,0 +1,13 @@
+services:
+  echoflow:
+    build: .
+    image: echoflow
+    container_name: echoflow
+    restart: unless-stopped
+    env_file: .env
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -4,13 +4,37 @@ A lightweight Discord music bot that plays audio from YouTube (single tracks, pl
 
 ## Features
 
+**Playback**
+
 - `/join` — connects the bot to your current voice channel
 - `/leave` — disconnects the bot and clears the queue
-- `/play <url>` — plays a track/playlist from a URL, or searches YouTube if a plain query is given
+- `/play <query>` — plays a track/playlist from a URL, or searches YouTube if a plain query is given
 - `/skip` — skips the currently playing track
 - `/stop` — stops playback and clears the queue
 
+**Queue**
+
+- `/queue [page]` — shows the current track and what is coming next, 10 per page
+- `/playnext <query>` — puts a track at the front of the queue, right after the current one
+- `/playnow <query>` — plays a track immediately, dropping the one that was playing
+- `/move <position> <destination>` — reorders a queued track (positions as shown by `/queue`)
+- `/nowplaying` — shows the current track with a progress bar
+
 Tracks are queued per-server, and playback automatically advances to the next track when one finishes.
+
+## Reliability
+
+- **Dropped voice connections are repaired automatically.** A watchdog supervises every active
+  player; if the voice connection stays down for 15 seconds it is rebuilt from scratch and the
+  current track resumes from the position it stopped at. A playback loop that dies for any other
+  reason is caught and reported instead of leaving the bot silently unresponsive.
+- **Stream links are resolved at playback time, never when queueing.** The queue only stores page
+  URLs, so links cannot expire while they wait. Every resolved stream is verified before ffmpeg
+  touches it, and rejected links (the usual `403 Forbidden`) are retried against other YouTube
+  player clients.
+- **Failures always answer.** Extraction is bounded by a timeout and every command reports what
+  went wrong, so a track that cannot be fetched produces an error message rather than a command
+  that never finishes.
 
 ## Requirements
 
@@ -52,21 +76,26 @@ On startup, the bot syncs its slash commands with Discord and logs a confirmatio
 
 Alternatively, you can run the bot in a container — FFmpeg and Opus are already included in the image, so no local dependencies are needed beyond Docker itself.
 
-1. Build the image:
+With Compose (recommended — build, run and restart policy in one command):
 
-   ```bash
-   docker build -t echoflow .
-   ```
+```bash
+cp .env.example .env   # then put your token in it
+docker compose up -d --build
+```
 
-2. Run the bot, passing the token via the environment file (see [Setup](#setup) for creating `.env`):
+`docker compose logs -f` follows the logs, `docker compose down` stops the bot, and
+`docker compose up -d --build` again picks up code changes.
 
-   ```bash
-   docker run -d --name echoflow --restart unless-stopped --env-file .env echoflow
-   ```
+Plain Docker works too:
 
-To view logs use `docker logs -f echoflow`, and to stop the bot use `docker stop echoflow`.
+```bash
+docker build -t echoflow .
+docker run -d --name echoflow --restart unless-stopped --env-file .env echoflow
+```
 
 ## Notes
 
 - `yt-dlp` handles metadata extraction and streaming for both direct links and search queries (`ytsearch1:<query>`).
-- Playlists are limited to the first 20 entries (`playlistend` in `YTDL_OPTIONS`).
+- Playlists are limited to the first 100 entries (`MAX_PLAYLIST_ITEMS` in `ytdl_source.py`).
+- The code is split into `main.py` (slash commands), `player.py` (per-guild queue, playback loop
+  and connection watchdog) and `ytdl_source.py` (yt-dlp extraction and stream resolution).

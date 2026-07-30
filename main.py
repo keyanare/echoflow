@@ -1,15 +1,21 @@
 import asyncio
-from collections import defaultdict
+import contextlib
+import traceback
 from os import getenv
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.utils import MISSING
 from dotenv import load_dotenv
 
-from ytdl_source import YTDLSource, ytdl
+from player import GuildPlayer, PlayerManager, now_playing_embed, queue_lines
+from ytdl_source import TrackError, format_duration, search
 
 load_dotenv()
+
+EMPTY_CHANNEL_GRACE = 30
+QUEUE_PAGE_SIZE = 10
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -18,232 +24,351 @@ intents.voice_states = True
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="", intents=intents)
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        self.players = PlayerManager(self)
 
     async def setup_hook(self):
         await self.tree.sync()
         print("[+] Slash commands successfully synchronized with Discord!")
 
+    async def close(self):
+        await self.players.shutdown()
+        await super().close()
+
 
 bot = MusicBot()
-song_queues = defaultdict(list)
-guild_locks = defaultdict(asyncio.Lock)
-text_channels = {}
 
 
 @bot.event
 async def on_ready():
-    print(self_name := f"[+] {bot.user.name} successfully started.")
+    print(f"[+] {bot.user.name} successfully started.")
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if member.bot or before.channel is None:
+    if member.id == bot.user.id:
+        await _on_own_voice_update(member, before, after)
         return
 
-    guild = before.channel.guild
+    if member.bot or before.channel is None or before.channel == after.channel:
+        return
+
+    guild = member.guild
     voice_client = guild.voice_client
     if voice_client is None or voice_client.channel != before.channel:
         return
-
-    members_left = [m for m in before.channel.members if not m.bot]
-    if len(members_left) > 0:
+    if any(not m.bot for m in before.channel.members):
         return
 
-    await asyncio.sleep(30)
+    await asyncio.sleep(EMPTY_CHANNEL_GRACE)
 
     voice_client = guild.voice_client
     if voice_client is None or voice_client.channel != before.channel:
         return
+    if any(not m.bot for m in voice_client.channel.members):
+        return
 
-    members_now = [m for m in voice_client.channel.members if not m.bot]
-    if len(members_now) == 0:
-        song_queues[guild.id] = []
-        await voice_client.disconnect()
+    player = bot.players.get(guild)
+    await player.announce(
+        "👋 Everyone left the voice channel — disconnecting, queue cleared."
+    )
+    await player.leave()
 
-        text_channel = text_channels.get(guild.id)
-        if text_channel is not None:
-            await text_channel.send(
-                "Everyone left the voice channel — disconnecting, queue cleared."
+
+async def _on_own_voice_update(member, before, after):
+    player = bot.players.peek(member.guild.id)
+    if player is None:
+        return
+
+    if after.channel is None:
+        if player.handle_forced_disconnect():
+            await player.announce(
+                "🔌 I was disconnected from the voice channel — queue cleared."
             )
+        return
+
+    player.channel = after.channel
 
 
-async def _play_next_async(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    async with guild_locks[guild_id]:
-        queue = song_queues[guild_id]
-        voice_client = interaction.guild.voice_client
-
-        if not voice_client or not voice_client.is_connected():
-            queue.clear()
-            return
-
-        if voice_client.is_playing() or voice_client.is_paused():
-            return
-
-        while len(queue) > 0:
-            next_track = queue.pop(0)
-            url = next_track["url"]
-            title = next_track["title"]
-
-            try:
-                player = await YTDLSource.from_url(url, loop=bot.loop)
-
-                if not voice_client.is_connected():
-                    queue.clear()
-                    return
-
-                voice_client.play(player, after=lambda e: play_next(interaction))
-                await interaction.channel.send(f"**Now playing:** {title}")
-                return
-            except Exception as e:
-                print(f"Playback error: {e}")
-                await interaction.channel.send(f"Can't play: {title}")
-
-                if not voice_client.is_connected():
-                    queue.clear()
-                    return
+# --------------------------------------------------------------------- helpers
 
 
-def play_next(interaction: discord.Interaction):
-    asyncio.run_coroutine_threadsafe(_play_next_async(interaction), bot.loop)
+async def _reply(interaction, content=MISSING, *, embed=MISSING, ephemeral=False):
+    if interaction.response.is_done():
+        await interaction.followup.send(content, embed=embed, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(
+            content, embed=embed, ephemeral=ephemeral
+        )
+
+
+async def _prepare(interaction, *, connect: bool = True) -> GuildPlayer | None:
+    """Return the guild player, connecting to the caller's voice channel first."""
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    if not connect:
+        return player
+
+    user_channel = interaction.user.voice.channel if interaction.user.voice else None
+    if not player.connected:
+        if user_channel is None:
+            await _reply(
+                interaction,
+                "You must be in a voice channel to use that command.",
+                ephemeral=True,
+            )
+            return None
+        try:
+            await player.connect(user_channel)
+        except (asyncio.TimeoutError, discord.ClientException) as exc:
+            await _reply(interaction, f"❌ Could not join the voice channel: {exc}")
+            return None
+
+    return player
+
+
+async def _enqueue(interaction, query: str, *, front: bool = False, now: bool = False):
+    await interaction.response.defer()
+
+    player = await _prepare(interaction)
+    if player is None:
+        return
+
+    try:
+        tracks, playlist_title = await search(query)
+    except TrackError as exc:
+        await _reply(interaction, f"❌ Could not load that: {exc}.")
+        return
+
+    for track in tracks:
+        track.requester_id = interaction.user.id
+
+    playing = player.current
+    was_idle = playing is None
+    player.add(tracks, front=front or now)
+
+    if len(tracks) == 1:
+        track = tracks[0]
+        if now and not was_idle:
+            prefix = "⏭️ Playing now"
+        elif front and not was_idle:
+            prefix = "⏫ Playing next"
+        else:
+            prefix = "➕ Added to queue"
+        await _reply(
+            interaction,
+            f"{prefix}: **{track.title}** (`{format_duration(track.duration)}`)",
+        )
+    else:
+        title = playlist_title or "Playlist"
+        await _reply(
+            interaction,
+            f"➕ Added **{title}** — {len(tracks)} tracks "
+            f"(`{format_duration(sum(t.duration or 0 for t in tracks))}`).",
+        )
+
+    # Only cut the track that was playing when the command was issued — it may
+    # have ended on its own while the query was being resolved.
+    if now and player.current is playing is not None:
+        player.skip()
+
+
+# -------------------------------------------------------------------- commands
 
 
 @bot.tree.command(name="join", description="Connect the bot to a voice channel.")
+@app_commands.guild_only()
 async def join(interaction: discord.Interaction):
     if not interaction.user.voice:
-        await interaction.response.send_message(
-            "You must be in voice channel to use that command."
+        await _reply(
+            interaction,
+            "You must be in a voice channel to use that command.",
+            ephemeral=True,
         )
         return
-    text_channels[interaction.guild_id] = interaction.channel
-    channel = interaction.user.voice.channel
-    if interaction.guild.voice_client is not None:
-        return await interaction.guild.voice_client.move_to(channel)
-    else:
-        await channel.connect()
 
-    await interaction.response.send_message(f"Connected to: **{channel.name}**")
-
-
-@bot.tree.command(name="leave", description="Disconnect bot from voice channel")
-async def leave(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    song_queues[guild_id] = []
-    voice_client = interaction.guild.voice_client
-    if voice_client:
-        voice_client.stop()
-        await voice_client.disconnect()
-        await interaction.response.send_message("The bot left the channel.")
-    else:
-        await interaction.response.send_message("I am not in the voice channel")
-
-
-@bot.tree.command(name="play", description="Play the track or playlist from link")
-@app_commands.describe(url="Link to a video, playlist or search query")
-async def play(interaction: discord.Interaction, url: str):
     await interaction.response.defer()
-
-    text_channels[interaction.guild_id] = interaction.channel
-
-    voice_client = interaction.guild.voice_client
-    if not voice_client:
-        if not interaction.user.voice:
-            await interaction.followup.send("You must be in voice channel")
-            return
-        channel = interaction.user.voice.channel
-        voice_client = await channel.connect()
-
-    guild_id = interaction.guild_id
-    loop = bot.loop
-
-    if guild_id not in song_queues:
-        song_queues[guild_id] = []
-
-    is_search = False
-    if not url.startswith(("http://", "https://")):
-        search_query = f"ytsearch1:{url}"
-        is_search = True
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(search_query, download=False)
-        )
-    else:
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(url, download=False)
-        )
-
-    if data is None:
-        await interaction.followup.send("Cannot load information, please try again.")
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+    channel = interaction.user.voice.channel
+    try:
+        await player.connect(channel)
+    except (asyncio.TimeoutError, discord.ClientException) as exc:
+        await _reply(interaction, f"❌ Could not join the voice channel: {exc}")
         return
 
-    tracks_to_add = []
+    await _reply(interaction, f"✅ Connected to: **{channel.name}**")
 
-    if "entries" in data:
-        entries = list(data["entries"])
 
-        if is_search and len(entries) == 1:
-            entry = entries[0]
-            if entry:
-                tracks_to_add.append(
-                    {
-                        "url": entry.get("url")
-                        or f"https://www.youtube.com/watch?v={entry.get('id')}",
-                        "title": entry.get("title", "Untitled"),
-                    }
-                )
-        else:
-            for entry in entries:
-                if entry:
-                    video_url = (
-                        entry.get("url")
-                        or f"https://www.youtube.com/watch?v={entry.get('id')}"
-                    )
-                    tracks_to_add.append(
-                        {"url": video_url, "title": entry.get("title", "Untitled")}
-                    )
+@bot.tree.command(name="leave", description="Disconnect the bot from the voice channel")
+@app_commands.guild_only()
+async def leave(interaction: discord.Interaction):
+    await interaction.response.defer()
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    if await player.leave():
+        await _reply(interaction, "👋 Left the voice channel, queue cleared.")
     else:
-        video_url = data.get("webpage_url") or data.get("url")
-        tracks_to_add.append({"url": video_url, "title": data.get("title", "Untitled")})
-
-    if not tracks_to_add:
-        await interaction.followup.send("No results found for your query.")
-        return
-
-    song_queues[guild_id].extend(tracks_to_add)
-
-    if len(tracks_to_add) == 1:
-        await interaction.followup.send(
-            f"Added to queue: **{tracks_to_add[0]['title']}**"
-        )
-    else:
-        playlist_title = data.get("title", "Playlist")
-        await interaction.followup.send(
-            f"Found and added to queue: **{playlist_title}** (Added {len(tracks_to_add)} songs)."
-        )
-
-    if not voice_client.is_playing() and not voice_client.is_paused():
-        await _play_next_async(interaction)
+        await _reply(interaction, "I am not in a voice channel.", ephemeral=True)
 
 
-@bot.tree.command(name="skip", description="Skip current song")
+@bot.tree.command(name="play", description="Play a track or playlist, or search")
+@app_commands.describe(query="Link to a video, a playlist, or a search query")
+@app_commands.guild_only()
+async def play(interaction: discord.Interaction, query: str):
+    await _enqueue(interaction, query)
+
+
+@bot.tree.command(name="playnext", description="Add a track to the front of the queue")
+@app_commands.describe(query="Link to a video, a playlist, or a search query")
+@app_commands.guild_only()
+async def playnext(interaction: discord.Interaction, query: str):
+    await _enqueue(interaction, query, front=True)
+
+
+@bot.tree.command(
+    name="playnow", description="Play a track immediately, skipping the current one"
+)
+@app_commands.describe(query="Link to a video, a playlist, or a search query")
+@app_commands.guild_only()
+async def playnow(interaction: discord.Interaction, query: str):
+    await _enqueue(interaction, query, now=True)
+
+
+@bot.tree.command(name="skip", description="Skip the current song")
+@app_commands.guild_only()
 async def skip(interaction: discord.Interaction):
-    voice_client = interaction.guild.voice_client
-    if voice_client and voice_client.is_playing():
-        voice_client.stop()
-        await interaction.response.send_message("Track skipped.")
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    title = player.current.title if player.current else None
+    if player.skip():
+        await _reply(interaction, f"⏭️ Skipped **{title}**.")
     else:
-        await interaction.response.send_message("Nothing is playing", ephemeral=True)
+        await _reply(interaction, "Nothing is playing.", ephemeral=True)
 
 
-@bot.tree.command(name="stop", description="Stop music and clear queue")
+@bot.tree.command(name="stop", description="Stop playback and clear the queue")
+@app_commands.guild_only()
 async def stop(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    song_queues[guild_id] = []
-    voice_client = interaction.guild.voice_client
-    if voice_client:
-        voice_client.stop()
-    await interaction.response.send_message("Playback is stopped, queue cleared.")
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    removed = len(player.queue)
+    await player.stop()
+    await _reply(interaction, f"⏹️ Playback stopped, {removed} queued track(s) cleared.")
 
 
-TOKEN = getenv("TOKEN")
-bot.run(TOKEN)
+@bot.tree.command(name="queue", description="Show the song queue")
+@app_commands.describe(page="Page of the queue to show (10 tracks per page)")
+@app_commands.guild_only()
+async def queue(interaction: discord.Interaction, page: int = 1):
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    if player.current is None and not player.queue:
+        await _reply(interaction, "The queue is empty.", ephemeral=True)
+        return
+
+    pages = max(1, -(-len(player.queue) // QUEUE_PAGE_SIZE))
+    page = min(max(page, 1), pages)
+    start = (page - 1) * QUEUE_PAGE_SIZE
+    chunk = player.queue[start : start + QUEUE_PAGE_SIZE]
+
+    embed = discord.Embed(title="🎶 Queue", colour=discord.Colour.blurple())
+    if player.current is not None:
+        embed.add_field(
+            name="Now playing",
+            value=(
+                f"{player.current.display}\n"
+                f"`{format_duration(player.elapsed)} / "
+                f"{format_duration(player.current.duration)}`"
+            ),
+            inline=False,
+        )
+    if chunk:
+        embed.add_field(
+            name="Up next",
+            value="\n".join(queue_lines(chunk, start + 1)),
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                f"Page {page}/{pages} · {len(player.queue)} track(s) · "
+                f"{format_duration(player.total_duration)} total"
+            )
+        )
+    else:
+        embed.set_footer(text="Nothing else is queued")
+
+    await _reply(interaction, embed=embed)
+
+
+@bot.tree.command(name="move", description="Move a queued track to another position")
+@app_commands.describe(
+    position="Current position of the track in the queue",
+    destination="Position to move it to",
+)
+@app_commands.guild_only()
+async def move(interaction: discord.Interaction, position: int, destination: int):
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    size = len(player.queue)
+    if size == 0:
+        await _reply(interaction, "The queue is empty.", ephemeral=True)
+        return
+    if not 1 <= position <= size or not 1 <= destination <= size:
+        await _reply(
+            interaction,
+            f"Positions must be between 1 and {size}.",
+            ephemeral=True,
+        )
+        return
+
+    track = player.move(position - 1, destination - 1)
+    await _reply(
+        interaction, f"↕️ Moved **{track.title}** to position **{destination}**."
+    )
+
+
+@bot.tree.command(name="nowplaying", description="Show the currently playing track")
+@app_commands.guild_only()
+async def nowplaying(interaction: discord.Interaction):
+    player = bot.players.get(interaction.guild)
+    player.text_channel = interaction.channel
+
+    embed = now_playing_embed(player, detailed=True)
+    if embed is None:
+        await _reply(interaction, "Nothing is playing.", ephemeral=True)
+        return
+    await _reply(interaction, embed=embed)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    original = getattr(error, "original", error)
+    traceback.print_exception(type(original), original, original.__traceback__)
+
+    message = (
+        f"❌ {original}"
+        if isinstance(original, TrackError)
+        else "❌ Something went wrong while running that command."
+    )
+    with contextlib.suppress(discord.HTTPException, discord.InteractionResponded):
+        await _reply(interaction, message, ephemeral=True)
+
+
+def main():
+    token = getenv("TOKEN")
+    if not token:
+        raise SystemExit("[!] TOKEN is not set — copy .env.example to .env first.")
+    bot.run(token)
+
+
+if __name__ == "__main__":
+    main()

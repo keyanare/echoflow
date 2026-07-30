@@ -12,6 +12,9 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
 
-COPY main.py ytdl_source.py ./
+COPY main.py player.py ytdl_source.py ./
+
+RUN useradd --create-home --uid 1000 echoflow && chown -R echoflow /app
+USER echoflow
 
 CMD ["uv", "run", "--frozen", "--no-sync", "main.py"]
