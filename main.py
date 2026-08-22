@@ -90,6 +90,13 @@ async def _on_own_voice_update(member, before, after):
     player.channel = after.channel
 
 
+@bot.event
+async def on_guild_remove(guild):
+    player = bot.players.remove(guild.id)
+    if player is not None:
+        await player.destroy()
+
+
 # --------------------------------------------------------------------- helpers
 
 

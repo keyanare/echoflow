@@ -404,6 +404,9 @@ class PlayerManager:
             return None
         return self._players.get(guild_id)
 
+    def remove(self, guild_id: int) -> GuildPlayer | None:
+        return self._players.pop(guild_id, None)
+
     async def shutdown(self) -> None:
         players = list(self._players.values())
         self._players.clear()
