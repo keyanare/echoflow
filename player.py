@@ -25,6 +25,13 @@ SELF_DISCONNECT_WINDOW = 5.0
 FINISHED = "finished"
 RESUME = "resume"
 STOPPED = "stopped"
+SKIPPED = "skipped"
+
+# A track that dies this soon after starting almost certainly hit a dead stream
+# link rather than finishing; the stream is re-resolved and playback resumes
+# from where it stopped instead of silently moving on to the next track.
+EARLY_DEATH_WINDOW = 15.0
+MAX_STREAM_RETRIES = 2
 
 
 class GuildPlayer:
@@ -111,7 +118,7 @@ class GuildPlayer:
             with contextlib.suppress(Exception):
                 voice_client.stop()
         # Advance even if the audio thread is wedged and never fires its callback.
-        self._finish(FINISHED)
+        self._finish(SKIPPED)
         return True
 
     async def stop(self) -> None:
@@ -219,6 +226,7 @@ class GuildPlayer:
 
     async def _play(self, track: Track) -> None:
         seek = 0.0
+        retries = 0
 
         while True:
             self._next.clear()
@@ -259,11 +267,27 @@ class GuildPlayer:
                 await self.announce(embed=now_playing_embed(self))
 
             await self._next.wait()
+            played_for = max(0.0, time.monotonic() - self._started_at)
             self._awaiting_end = False
+            position = seek + played_for
 
-            if self._finish_reason != RESUME:
-                return
-            seek = self._offset + max(0.0, time.monotonic() - self._started_at)
+            if self._finish_reason == RESUME:
+                seek = position
+                continue
+
+            died_young = played_for < EARLY_DEATH_WINDOW and (
+                track.duration is None or position < track.duration * 0.9
+            )
+            if self._finish_reason == FINISHED and died_young:
+                if retries < MAX_STREAM_RETRIES:
+                    retries += 1
+                    seek = position
+                    await self.announce(
+                        "🔄 The stream cut out — picking up where it left off."
+                    )
+                    continue
+                await self.announce(f"⚠️ **{track.title}** keeps cutting out — skipping.")
+            return
 
     async def _await_idle(self, voice_client: discord.VoiceClient) -> None:
         """Give a previous source a moment to release the voice client."""

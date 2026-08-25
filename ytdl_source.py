@@ -55,10 +55,12 @@ SEARCH_OPTIONS: dict[str, Any] = _BASE_OPTIONS | {
 
 STREAM_OPTIONS: dict[str, Any] = _BASE_OPTIONS | {"noplaylist": True}
 
-# YouTube hands out stream links that are tied to the client that asked for them.
-# When one of them gets rejected (the classic "403 Forbidden" right after playback
-# starts), asking again as a different client usually produces a working link.
-PLAYER_CLIENTS: tuple[str | None, ...] = (None, "web_safari", "android_vr", "tv")
+# YouTube's SABR rollout has stripped plain progressive URLs from most clients:
+# their links pass small range requests yet refuse full downloads with 403,
+# which is exactly how ffmpeg dies right after a link looked fine. The `android`
+# client still hands out ordinary CDN links; the yt-dlp default chain stays as
+# a fallback for content `android` cannot serve (and for when this changes).
+PLAYER_CLIENTS: tuple[str | None, ...] = ("android", None)
 
 FFMPEG_OPTIONS = "-vn"
 FFMPEG_BEFORE_OPTIONS = (
@@ -185,19 +187,31 @@ def _player_clients(url: str) -> tuple[str | None, ...]:
     return (None,)
 
 
+PROBE_BYTES = 64 * 1024
+
+
 async def _stream_problem(url: str, headers: dict[str, str]) -> str | None:
-    """Fetch the first bytes; returns None if fine, else why it is not playable."""
+    """Start a real download; returns None if data flows, else why it will not.
+
+    A range request is not a valid check anymore: YouTube answers those with
+    206 even for links it refuses to serve in full, so only reading the body
+    like ffmpeg would reveals a dead link.
+    """
     if not url.startswith(("http://", "https://")):
         return None
 
-    probe_headers = headers | {"Range": "bytes=0-1"}
     timeout = aiohttp.ClientTimeout(total=PROBE_TIMEOUT)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=probe_headers) as response:
-                return None if response.status < 400 else f"HTTP {response.status}"
+            async with session.get(url, headers=headers) as response:
+                if response.status >= 400:
+                    return f"HTTP {response.status}"
+                await response.content.read(PROBE_BYTES)
+                return None
+    # A read that merely times out means a slow stream, not a broken one —
+    # let ffmpeg and its reconnect options deal with speed.
     except asyncio.TimeoutError:
-        return "timed out"
+        return None
     except (aiohttp.ClientError, OSError) as exc:
         return type(exc).__name__
 

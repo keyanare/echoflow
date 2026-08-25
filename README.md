@@ -29,9 +29,13 @@ Tracks are queued per-server, and playback automatically advances to the next tr
   current track resumes from the position it stopped at. A playback loop that dies for any other
   reason is caught and reported instead of leaving the bot silently unresponsive.
 - **Stream links are resolved at playback time, never when queueing.** The queue only stores page
-  URLs, so links cannot expire while they wait. Every resolved stream is verified before ffmpeg
-  touches it, and rejected links (the usual `403 Forbidden`) are retried against other YouTube
-  player clients.
+  URLs, so links cannot expire while they wait. Every resolved stream is verified with a real
+  download before ffmpeg touches it — YouTube answers small range requests with 200 even for links
+  it refuses to serve (SABR), so only reading the body reveals a dead one. Rejected links (the
+  usual `403 Forbidden`) are retried against other YouTube player clients.
+- **Streams that die mid-track are recovered automatically.** A track that cuts out seconds after
+  starting is re-resolved against another player client and resumes from where it stopped, instead
+  of being silently skipped.
 - **Failures always answer.** Extraction is bounded by a timeout and every command reports what
   went wrong, so a track that cannot be fetched produces an error message rather than a command
   that never finishes.
