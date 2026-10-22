@@ -10,15 +10,18 @@ A lightweight Discord music bot that plays audio from YouTube (single tracks, pl
 - `/leave` — disconnects the bot and clears the queue
 - `/play <query>` — plays a track/playlist from a URL, or searches YouTube if a plain query is given
 - `/skip` — skips the currently playing track
+- `/pause` — pauses or resumes the current track
+- `/seek <position>` — jumps to a position (`90`, `1:30` or `1:02:03`)
+- `/repeat` — toggles repeating the current track
 - `/stop` — stops playback and clears the queue
 
 **Queue**
 
-- `/queue [page]` — shows the current track and what is coming next, 10 per page
+- `/queue [page]` — shows the current track and what is coming next, 10 per page, with buttons to flip pages
 - `/playnext <query>` — puts a track at the front of the queue, right after the current one
 - `/playnow <query>` — plays a track immediately, dropping the one that was playing
 - `/move <position> <destination>` — reorders a queued track (positions as shown by `/queue`)
-- `/nowplaying` — shows the current track with a progress bar
+- `/nowplaying` — shows the current track with a progress bar and buttons to pause, seek, repeat or skip
 
 Tracks are queued per-server, and playback automatically advances to the next track when one finishes.
 
@@ -36,6 +39,10 @@ Tracks are queued per-server, and playback automatically advances to the next tr
 - **Streams that die mid-track are recovered automatically.** A track that cuts out seconds after
   starting is re-resolved against another player client and resumes from where it stopped, instead
   of being silently skipped.
+- **Forced-order commands never eat tracks.** Every start of a track is tagged, and the completion
+  callback a stopped source still fires is discarded once it belongs to a replaced track. `/skip`,
+  `/playnow`, `/stop` and `/leave` therefore advance exactly one track, even when pressed while the
+  next stream is still being resolved.
 - **Failures always answer.** Extraction is bounded by a timeout and every command reports what
   went wrong, so a track that cannot be fetched produces an error message rather than a command
   that never finishes.
@@ -101,5 +108,6 @@ docker run -d --name echoflow --restart unless-stopped --env-file .env echoflow
 
 - `yt-dlp` handles metadata extraction and streaming for both direct links and search queries (`ytsearch1:<query>`).
 - Playlists are limited to the first 100 entries (`MAX_PLAYLIST_ITEMS` in `ytdl_source.py`).
-- The code is split into `main.py` (slash commands), `player.py` (per-guild queue, playback loop
-  and connection watchdog) and `ytdl_source.py` (yt-dlp extraction and stream resolution).
+- Queue pages and `/nowplaying` panels keep their buttons for five minutes (`VIEW_TIMEOUT` in `main.py`).
+- The code is split into `main.py` (slash commands and UI views), `player.py` (per-guild queue,
+  playback loop and connection watchdog) and `ytdl_source.py` (yt-dlp extraction and stream resolution).
