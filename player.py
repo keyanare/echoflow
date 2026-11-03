@@ -36,6 +36,10 @@ SEEK = "seek"
 # from where it stopped instead of silently moving on to the next track.
 EARLY_DEATH_WINDOW = 15.0
 MAX_STREAM_RETRIES = 2
+# A stream that yields less than this when it was supposed to start from the
+# beginning never actually played: that is a broken link, not an interruption,
+# so it must not be reported as "the stream cut out".
+MIN_AUDIO_FOR_RETRY = 0.5
 
 # Tracks per /queue page and the character budget of a single embed field.
 QUEUE_PAGE_SIZE = 10
@@ -144,16 +148,18 @@ class GuildPlayer:
         """Advance past the current track, even if it is still being resolved."""
         if self.current is None:
             return False
+
+        # The track already ended on its own (a natural end, or a dead stream the
+        # loop is about to retry). The user asked for the *next* track, so turn
+        # that pending end into a skip: without this the loop treats a dead
+        # stream as "resume where it left off" and burns through the queue.
         if self._awaiting_end and self._finish_reason == FINISHED:
-            # The track already ended on its own and the loop is about to move
-            # on, so that advance satisfies this request; counting it again
-            # would swallow the next track.
+            self._finish_reason = SKIPPED
             return True
 
-        # Each request is consumed exactly once: either when a track that was
-        # still being resolved is dropped before it starts, or when an on-air
-        # track ends with SKIPPED. That is what keeps /skip from eating two
-        # tracks while still honouring a double press.
+        # Otherwise the request is recorded and consumed exactly once by the
+        # playback loop: it either drops a track that is still being resolved
+        # before starting it, or advances right after the on-air track ends.
         self._skips += 1
         voice_client = self.voice_client
         if voice_client is not None:
@@ -278,6 +284,7 @@ class GuildPlayer:
         seek = 0.0
         retries = 0
         resumptions = 0
+        retried_dead = False
         replaying = False
 
         while True:
@@ -356,8 +363,11 @@ class GuildPlayer:
             reason = self._finish_reason
             replaying = True
 
-            if reason == SKIPPED and self._skips > 0:
-                # Skip requested while this track was still starting up.
+            # A skip always wins over whatever reason produced this wake-up: the
+            # user asked for the next track, so never retry, resume or repeat the
+            # one that just ended — that is what used to burn through the queue
+            # with "the stream cut out" messages.
+            if self._skips > 0:
                 self._skips -= 1
                 return
 
@@ -380,9 +390,28 @@ class GuildPlayer:
             if reason in (SKIPPED, STOPPED):
                 return
 
+            # A stream that never produced a single second of audio did not
+            # "cut out" — it never started. Re-resolving the same link a second
+            # time is worth one try (a different player client may be picked),
+            # but it must not be reported as a mid-track interruption, and it
+            # must not be retried twice as if the position mattered.
+            never_started = seek == 0.0 and played_for < MIN_AUDIO_FOR_RETRY
             died_young = played_for < EARLY_DEATH_WINDOW and (
                 track.duration is None or position < track.duration * 0.9
             )
+
+            if reason == FINISHED and never_started:
+                if not retried_dead:
+                    retried_dead = True
+                    await self.announce(
+                        f"🔄 **{track.title}** produced no audio — re-resolving."
+                    )
+                    continue
+                await self.announce(
+                    f"⚠️ Skipping **{track.title}** — the stream produced no audio."
+                )
+                return
+
             if reason == FINISHED and died_young:
                 if retries < MAX_STREAM_RETRIES:
                     retries += 1
