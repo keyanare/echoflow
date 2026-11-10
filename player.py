@@ -273,6 +273,8 @@ class GuildPlayer:
                     await self.announce(f"⚠️ Skipping **{title}** — playback error.")
                 await asyncio.sleep(1)
             finally:
+                if self._skips > 0:
+                    self._skips -= 1
                 self.current = None
                 self._awaiting_end = False
                 self._active_token = None
