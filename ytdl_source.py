@@ -44,7 +44,6 @@ _BASE_OPTIONS: dict[str, Any] = {
     "no_warnings": True,
     "noprogress": True,
     "logtostderr": False,
-    "nocheckcertificate": True,
     "ignoreerrors": False,
     "skip_download": True,
     "source_address": "0.0.0.0",
