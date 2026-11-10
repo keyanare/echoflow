@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -17,6 +18,11 @@ MAX_PLAYLIST_ITEMS = 100
 SEARCH_TIMEOUT = 60.0
 STREAM_TIMEOUT = 30.0
 PROBE_TIMEOUT = 10.0
+EXTRACT_WORKERS = 4
+
+_EXTRACT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=EXTRACT_WORKERS, thread_name_prefix="yt-dlp"
+)
 
 
 class _QuietLogger:
@@ -226,7 +232,9 @@ async def _extract(
             return ydl.extract_info(query, download=False)
 
     try:
-        data = await asyncio.wait_for(loop.run_in_executor(None, run), timeout)
+        data = await asyncio.wait_for(
+            loop.run_in_executor(_EXTRACT_EXECUTOR, run), timeout
+        )
     except asyncio.TimeoutError as exc:
         raise TrackError("the source took too long to answer") from exc
     except yt_dlp.utils.DownloadError as exc:
