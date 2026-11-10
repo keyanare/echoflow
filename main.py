@@ -109,11 +109,15 @@ async def on_guild_remove(guild):
 
 async def _reply(interaction, content=MISSING, *, embed=MISSING, view=MISSING, ephemeral=False):
     if interaction.response.is_done():
-        await interaction.followup.send(content, embed=embed, view=view, ephemeral=ephemeral)
-    else:
-        await interaction.response.send_message(
+        message = await interaction.followup.send(
             content, embed=embed, view=view, ephemeral=ephemeral
         )
+    else:
+        message = await interaction.response.send_message(
+            content, embed=embed, view=view, ephemeral=ephemeral
+        )
+    if view is not MISSING:
+        view.message = message
 
 
 async def _prepare(interaction, *, connect: bool = True) -> GuildPlayer | None:
