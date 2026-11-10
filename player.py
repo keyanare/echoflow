@@ -398,8 +398,10 @@ class GuildPlayer:
             # but it must not be reported as a mid-track interruption, and it
             # must not be retried twice as if the position mattered.
             never_started = seek == 0.0 and played_for < MIN_AUDIO_FOR_RETRY
-            died_young = played_for < EARLY_DEATH_WINDOW and (
-                track.duration is None or position < track.duration * 0.9
+            ended_early = (
+                position < track.duration * 0.9
+                if track.duration is not None
+                else played_for < EARLY_DEATH_WINDOW
             )
 
             if reason == FINISHED and never_started:
@@ -414,7 +416,7 @@ class GuildPlayer:
                 )
                 return
 
-            if reason == FINISHED and died_young:
+            if reason == FINISHED and ended_early:
                 if retries < MAX_STREAM_RETRIES:
                     retries += 1
                     seek = position
