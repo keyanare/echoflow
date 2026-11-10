@@ -211,7 +211,8 @@ async def _stream_problem(url: str, headers: dict[str, str]) -> str | None:
             async with session.get(url, headers=headers) as response:
                 if response.status >= 400:
                     return f"HTTP {response.status}"
-                await response.content.read(PROBE_BYTES)
+                if not await response.content.read(PROBE_BYTES):
+                    return "empty response body"
                 return None
     # A read that merely times out means a slow stream, not a broken one —
     # let ffmpeg and its reconnect options deal with speed.
